@@ -210,6 +210,8 @@ function apiErr(status,body){
   var e=new Error(msg||("HTTP "+status));e.status=status;e.apiMessage=msg;return e}
 function api(path,opts,retried){
   opts=opts||{};
+  var pre=(token&&Date.now()>tokenExp&&!retried)?refreshToken():Promise.resolve();
+  return pre.then(function(){
   var headers={"Authorization":"Bearer "+token};
   if(opts.body)headers["Content-Type"]="application/json";
   return fetch("https://sheets.googleapis.com/v4/spreadsheets/"+CFG.SHEET_ID+path,{method:opts.method||"GET",headers:headers,body:opts.body?JSON.stringify(opts.body):undefined})
@@ -217,14 +219,18 @@ function api(path,opts,retried){
       return r.json().catch(function(){return null}).then(function(j){
         if(r.ok)return j;
         if(r.status===401&&!retried){return refreshToken().then(function(){return api(path,opts,true)})}
-        throw apiErr(r.status,j)})})}
+        throw apiErr(r.status,j)})})})}
 function enc(s){return encodeURIComponent(s)}
 function getValues(range){return api("/values/"+enc(range)).then(function(j){return (j&&j.values)||[]})}
 
 /* ============ התחברות ============ */
 function configured(){return CFG.CLIENT_ID&&CFG.CLIENT_ID.indexOf("YOUR_CLIENT_ID")!==0}
-var viaRedirect=false;
-function refreshToken(){var e=new Error("expired");e.auth=true;return Promise.reject(e)}
+function fetchToken(){
+  return fetch("/api/auth/token",{headers:{"X-Requested-With":"dashboard"},cache:"no-store",credentials:"same-origin"}).then(function(r){
+    if(r.status===401){var e=new Error("no_session");e.auth=true;throw e}
+    if(!r.ok)throw new Error("token_"+r.status);
+    return r.json()}).then(function(j){token=j.access_token;tokenExp=Date.now()+(j.expires_in||3600)*1000-120000;return token})}
+function refreshToken(){return fetchToken()}
 
 function showGate(opts){
   opts=opts||{};
@@ -247,27 +253,16 @@ function showGate(opts){
   box.appendChild(el("p","small","אין הרשאה? בקשו מבעל הגיליון להוסיף את החשבון שלכם כעורך."));
   g.appendChild(box)}
 
-function signInRedirect(){
-  var st=Math.random().toString(36).slice(2)+Date.now().toString(36);
-  try{sessionStorage.setItem("oauth_state",st)}catch(e){}
-  var u="https://accounts.google.com/o/oauth2/v2/auth?client_id="+encodeURIComponent(CFG.CLIENT_ID)
-    +"&redirect_uri="+encodeURIComponent(location.origin+"/")+"&response_type=token&scope="+encodeURIComponent(CFG.SCOPE)
-    +"&include_granted_scopes=true&prompt=select_account&state="+encodeURIComponent(st);
-  location.href=u}
-function consumeHash(){
-  var h=location.hash||"";if(h.length<2)return null;
-  var p=new URLSearchParams(h.slice(1));
-  if(!p.get("access_token")&&!p.get("error"))return null;
-  var want=null;try{want=sessionStorage.getItem("oauth_state");sessionStorage.removeItem("oauth_state")}catch(e){}
-  try{history.replaceState(null,"",location.pathname+location.search)}catch(e){}
-  if(p.get("error"))return {error:"גוגל החזירה שגיאה: "+p.get("error")+". בדקו שהמייל שלכם ברשימת Test users ושהכתובת מוגדרת ב-Redirect URIs."};
-  if(!want||p.get("state")!==want)return {error:"ההתחברות לא אומתה. נסו שוב."};
-  return {token:p.get("access_token"),exp:Number(p.get("expires_in"))||3600}}
+function signInRedirect(){location.href="/api/auth/login"}
+var AUTH_ERRORS={access_denied:"ההתחברות בוטלה או שהחשבון לא נמצא ברשימת Test users.",missing_scope:"צריך לאשר את הגישה לגיליונות Google כדי להיכנס.",state:"ההתחברות לא אומתה. נסו שוב.",no_refresh_token:"גוגל לא החזירה אישור התחברות ממושך. נסו שוב.",invalid_client:"הגדרות ה-Client בשרת שגויות (בדקו GOOGLE_CLIENT_SECRET).",redirect_uri_mismatch:"הכתובת /api/auth/callback לא רשומה ב-Authorized redirect URIs."};
+function urlError(){
+  var e=new URLSearchParams(location.search).get("autherror");if(!e)return null;
+  try{history.replaceState(null,"",location.pathname)}catch(x){}
+  return AUTH_ERRORS[e]||("גוגל החזירה שגיאה: "+e)}
 
 function signOut(){
-  var t=token;token=null;rows=[];loaded=false;readOnly=false;
-  try{if(t)fetch("https://oauth2.googleapis.com/revoke?token="+encodeURIComponent(t),{method:"POST",mode:"no-cors"})}catch(e){}
-  showGate()}
+  token=null;rows=[];loaded=false;readOnly=false;stopPolling();
+  fetch("/api/auth/logout",{method:"POST",headers:{"X-Requested-With":"dashboard"},credentials:"same-origin"}).catch(function(){}).then(function(){showGate()})}
 
 /* ============ טעינה וסנכרון ============ */
 function parse(values){
@@ -535,9 +530,11 @@ $("#signout").onclick=signOut;
 
 /* ה-Client ID נקרא ממשתנה הסביבה GOOGLE_CLIENT_ID דרך /api/config. אם אין, נשאר הערך שבהגדרות למעלה. */
 fetch("/api/config",{cache:"no-store"}).then(function(r){return r.ok?r.json():null}).then(function(j){if(j&&j.clientId)CFG.CLIENT_ID=j.clientId}).catch(function(){}).then(function(){
-  var h=consumeHash();
-  if(h&&h.token){token=h.token;tokenExp=Date.now()+h.exp*1000-60000;viaRedirect=true;loadAll(true);return}
-  showGate(h&&h.error?{error:h.error}:undefined)});
+  var err=urlError();
+  if(err){showGate({error:err});return}
+  fetchToken().then(function(){return loadAll(true)}).catch(function(e){
+    if(e&&e.auth)showGate();
+    else showGate({error:"אי אפשר להתחבר לשרת כרגע. נסו שוב בעוד רגע."})})});
 })();
 </script>
 </body>
